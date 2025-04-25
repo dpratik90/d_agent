@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dev_agent"
+version = "0.1.0"
+authors = [
+    { name="Swathi Kondapalli", email="swathi.kondapalli@example.com" },
+]
+description = "A development agent for code generation and review"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "python-dotenv==1.0.0",
+    "openai==0.28.1",
+    "gitpython==3.1.42",
+    "pydantic==2.6.3",
+    "pydantic-settings==2.1.0",
+    "typer==0.9.0",
+    "pytest==8.0.0",
+    "black==24.2.0",
+    "flake8==7.0.0",
+    "mypy==1.8.0",
+    "PyGithub==2.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dev_agent*"]
+
+[project.scripts]
+dev-agent = "dev_agent.main:app" 
