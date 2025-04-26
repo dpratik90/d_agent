@@ -16,7 +16,7 @@ class GitManager:
         
         self.settings = settings
         self.github = Github(settings.GITHUB_TOKEN)
-        self.repo = self.github.get_user(settings.GITHUB_REPO_OWNER).get_repo(settings.GITHUB_REPO_NAME)
+        self.repo = self.github.get_repo(f"{settings.GITHUB_REPO_OWNER}/{settings.GITHUB_REPO_NAME}")
         self.workspace_path = Path(os.path.expanduser(settings.WORKSPACE_PATH))
         self.default_branch = settings.GIT_DEFAULT_BRANCH
         
@@ -159,6 +159,15 @@ class GitManager:
         except Exception as e:
             print(f"Error pushing changes: {str(e)}")
             print("======================================\n")
+            raise
+
+    def get_current_branch(self) -> str:
+        """Get the name of the current branch."""
+        try:
+            repo = Repo(self.workspace_path)
+            return repo.active_branch.name
+        except Exception as e:
+            print(f"Error getting current branch: {str(e)}")
             raise
 
     def create_merge_request(self, branch: str, title: str, description: str) -> str:
