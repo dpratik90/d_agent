@@ -5,6 +5,7 @@ import re
 import json
 import typer
 import asyncio
+import black
 from typing import Optional, Dict, Tuple
 from .config.settings import Settings
 from .core.llm.openai_llm import OpenAILLM
@@ -18,11 +19,23 @@ git = GitManager(settings)
 # Create Typer app
 app = typer.Typer()
 
+def run_async_command(coro):
+    """Helper function to run async commands."""
+    try:
+        return asyncio.run(coro)
+    except Exception as e:
+        print(f"Error running async command: {e}")
+        raise typer.Exit(1)
+
 @app.command()
 def respond(
     branch_name: str = typer.Argument(..., help="Branch name (e.g. feature/my-branch)")
 ):
     """Respond to review comments and make necessary code changes."""
+    return run_async_command(_respond(branch_name))
+
+async def _respond(branch_name: str):
+    """Async implementation of respond command."""
     print(f"\n=== Debug: Respond Command ===")
     print(f"Branch name: {branch_name}")
     print("======================================\n")
@@ -49,7 +62,7 @@ def respond(
 
         print(f"Found pull request: {pr.html_url}")
 
-        # Get all review comments
+        # Get all submitted review comments
         comments = pr.get_review_comments()
         print(f"\n=== Debug: Review Comments ===")
         print(f"Comments type: {type(comments)}")
@@ -57,7 +70,7 @@ def respond(
         print("======================================\n")
         
         if comments.totalCount == 0:
-            typer.echo("No review comments found")
+            typer.echo("No submitted review comments found")
             return
 
         # Group comments by file
@@ -68,7 +81,6 @@ def respond(
             print(f"Comment ID: {comment.id}")
             print(f"Comment Path: {comment.path}")
             print(f"Comment Position: {comment.position}")
-            print(f"Comment Line: {comment.line}")
             print(f"Comment Body: {comment.body}")
             print("======================================\n")
             
@@ -83,7 +95,6 @@ def respond(
             for comment in comments_list:
                 print(f"  - Comment ID: {comment.id}")
                 print(f"  - Comment Position: {comment.position}")
-                print(f"  - Comment Line: {comment.line}")
         print("======================================\n")
 
         # Process each file
@@ -91,8 +102,49 @@ def respond(
             print(f"\nProcessing file: {file_path}")
 
             try:
+                # Check if file exists in the workspace
+                if not os.path.exists(file_path):
+                    print(f"File {file_path} does not exist in workspace. Skipping file changes.")
+                    # Still respond to comments even if file doesn't exist
+                    for comment in comments:
+                        try:
+                            analysis = await llm.analyze_review_comment(comment.body, "")
+                            analysis_dict = None
+                            try:
+                                analysis_dict = json.loads(analysis)
+                            except json.JSONDecodeError as e:
+                                print(f"Error parsing analysis JSON: {e}")
+                                print(f"Raw analysis: {analysis}")
+                                continue
+                            
+                            if not analysis_dict:
+                                continue
+                            
+                            # Reply to the comment
+                            try:
+                                pr.create_review_comment(
+                                    body=analysis_dict.get('response', 'No response provided.'),
+                                    commit=comment.commit_id,
+                                    path=comment.path,
+                                    position=comment.position,
+                                    in_reply_to=comment.id
+                                )
+                            except Exception as e:
+                                print(f"Error creating comment reply: {e}")
+                                # Fallback to issue comment
+                                try:
+                                    pr.create_issue_comment(
+                                        f"In response to comment on {comment.path}:\n\n{comment.body}\n\n{analysis_dict.get('response', 'No response provided.')}"
+                                    )
+                                except Exception as e:
+                                    print(f"Error creating fallback issue comment: {e}")
+                        except Exception as e:
+                            print(f"Error processing comment: {e}")
+                    continue
+
                 # Get current file content
-                file_content = git.repo.get_contents(file_path, ref=branch_name).decoded_content.decode()
+                with open(file_path, 'r') as f:
+                    file_content = f.read()
                 lines = file_content.split('\n')
 
                 # Analyze comments and determine changes needed
@@ -100,7 +152,6 @@ def respond(
                 for comment in comments:
                     print(f"\n=== Debug: Processing Comment ===")
                     print(f"Comment ID: {comment.id}")
-                    print(f"Comment Line: {comment.line}")
                     print(f"Comment Position: {comment.position}")
                     print("======================================\n")
 
@@ -112,7 +163,7 @@ def respond(
                     while retry_count < max_retries:
                         try:
                             # Analyze the comment
-                            analysis = llm.analyze_review_comment(comment.body, file_content)
+                            analysis = await llm.analyze_review_comment(comment.body, file_content)
                             print("Analysis generated successfully")
                             print("Analysis:")
                             print("-" * 40)
@@ -120,6 +171,7 @@ def respond(
                             print("-" * 40)
 
                             # Parse the analysis
+                            analysis_dict = None
                             try:
                                 # Clean up the analysis string before parsing
                                 analysis = analysis.strip()
@@ -134,20 +186,6 @@ def respond(
                                 analysis_dict = json.loads(analysis)
                                 print(f"Analysis after parsing: {analysis_dict}")
                                 print("======================================\n")
-
-                                if analysis_dict.get("change_needed", False):
-                                    print(f"\n=== Debug: Change Needed ===")
-                                    print(f"Comment line: {comment.line}")
-                                    print(f"Comment position: {comment.position}")
-                                    change = {
-                                        'comment': comment,
-                                        'analysis': analysis_dict,
-                                        'position': comment.line or 1
-                                    }
-                                    print(f"Change position: {change['position']}")
-                                    changes_needed.append(change)
-                                    print("======================================\n")
-                                break  # Success, exit retry loop
                             except json.JSONDecodeError as e:
                                 print(f"Error parsing analysis: {e}")
                                 print(f"Analysis content: {analysis}")
@@ -156,6 +194,42 @@ def respond(
                                     print("Max retries reached for JSON parsing")
                                     break
                                 continue
+
+                            if not analysis_dict:
+                                continue
+
+                            if analysis_dict.get("change_needed", False):
+                                print(f"\n=== Debug: Change Needed ===")
+                                print(f"Comment position: {comment.position}")
+                                change = {
+                                    'comment': comment,
+                                    'analysis': analysis_dict,
+                                    'position': comment.position or 1
+                                }
+                                print(f"Change position: {change['position']}")
+                                changes_needed.append(change)
+                                print("======================================\n")
+
+                            # Always respond to the comment
+                            try:
+                                pr.create_review_comment(
+                                    body=analysis_dict.get('response', 'No response provided.'),
+                                    commit=comment.commit_id,
+                                    path=comment.path,
+                                    position=comment.position,
+                                    in_reply_to=comment.id
+                                )
+                            except Exception as e:
+                                print(f"Error creating comment reply: {e}")
+                                # Fallback to issue comment
+                                try:
+                                    pr.create_issue_comment(
+                                        f"In response to comment on {comment.path}:\n\n{comment.body}\n\n{analysis_dict.get('response', 'No response provided.')}"
+                                    )
+                                except Exception as e:
+                                    print(f"Error creating fallback issue comment: {e}")
+
+                            break  # Success, exit retry loop
                         except Exception as e:
                             print(f"Error analyzing review comment: {e}")
                             if "account is not active" in str(e):
@@ -172,60 +246,60 @@ def respond(
                 for change in changes_needed:
                     print(f"Change position: {change['position']}")
                     print(f"Change suggested: {change['analysis'].get('suggested_change')[:100]}...")
-                print("======================================\n")
 
-                if not changes_needed:
-                    print(f"No changes needed for {file_path}")
-                    continue
-
-                # Make the changes
-                new_lines = lines.copy()
-                for change in sorted(changes_needed, key=lambda x: x.get('position', 0), reverse=True):
-                    new_code = change['analysis'].get('suggested_change')
-                    if new_code:
-                        if 'position' in change and change['position'] is not None:
-                            line_num = change['position'] - 1  # Convert to 0-based index
-                            new_lines[line_num] = new_code
-                        else:
-                            new_lines.append(new_code)
-
-                # Write the changes
-                new_content = '\n'.join(new_lines)
-                git.repo.update_file(
-                    path=file_path,
-                    message=f"Address review comments for {file_path}",
-                    content=new_content,
-                    sha=git.repo.get_contents(file_path, ref=branch_name).sha,
-                    branch=branch_name
-                )
-
-                # Respond to the comments
-                for change in changes_needed:
-                    comment = change['comment']
-                    response = f"✅ Addressed: {change['analysis'].get('response', 'Changes made based on review')}"
+                # Apply changes if needed
+                if changes_needed:
+                    # Sort changes by position in reverse order to avoid line number issues
+                    changes_needed.sort(key=lambda x: x['position'], reverse=True)
+                    
+                    # Get the suggested changes
+                    suggested_changes = [change['analysis'].get('suggested_change') for change in changes_needed]
+                    
+                    # Format the code using black
                     try:
-                        # Create a review comment reply
-                        pr.create_review_comment(
-                            body=response,
-                            commit_id=comment.commit_id,
-                            path=comment.path,
-                            position=comment.position,
-                            in_reply_to=comment.id
-                        )
-                        print(f"Responded to comment: {comment.id}")
+                        formatted_code = black.format_str('\n'.join(suggested_changes), mode=black.FileMode())
+                        print("\nFormatted code:")
+                        print("-" * 40)
+                        print(formatted_code)
+                        print("-" * 40)
                     except Exception as e:
-                        print(f"Error responding to comment: {e}")
+                        print(f"Error formatting code: {e}")
+                        formatted_code = '\n'.join(suggested_changes)
+                    
+                    # Write the formatted code back to the file
+                    try:
+                        with open(file_path, 'w') as f:
+                            f.write(formatted_code)
+                        print(f"\nSuccessfully wrote changes to {file_path}")
+                    except Exception as e:
+                        print(f"Error writing changes to file: {e}")
+                        continue
 
+                    # Commit and push changes
+                    try:
+                        git.repo.index.add([file_path])
+                        git.repo.index.commit(f"Apply review comments to {file_path}")
+                        git.repo.remote().push(branch_name)
+                        print(f"\nSuccessfully pushed changes to {branch_name}")
+                    except Exception as e:
+                        print(f"Error committing and pushing changes: {e}")
+                        continue
+
+            except FileNotFoundError:
+                print(f"File not found: {file_path}")
+                continue
             except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+                print(f"Error processing file {file_path}: {e}")
+                continue
 
-        typer.echo(f"Successfully responded to review comments: {pr.html_url}")
+        print(f"\nSuccessfully responded to review comments for PR: {pr.html_url}")
 
     except Exception as e:
-        typer.echo(f"Error responding to review: {e}")
+        print(f"Error in respond command: {e}")
+        raise typer.Exit(1)
 
 @app.command()
-async def generate(
+def generate(
     task: str = typer.Argument(..., help="Task description"),
     output_file: str = typer.Argument(..., help="Output file path"),
     branch_name: str = typer.Argument(..., help="Branch name (e.g. my-feature)"),
@@ -233,6 +307,16 @@ async def generate(
     mr_title: str = typer.Option(None, "--mr-title", help="Merge request title")
 ):
     """Generate code based on task description and create a feature branch."""
+    return run_async_command(_generate(task, output_file, branch_name, create_mr, mr_title))
+
+async def _generate(
+    task: str,
+    output_file: str,
+    branch_name: str,
+    create_mr: bool,
+    mr_title: Optional[str]
+):
+    """Async implementation of generate command."""
     print(f"\n=== Debug: Generate Command ===")
     print(f"Task: {task}")
     print(f"Output file: {output_file}")
@@ -271,15 +355,19 @@ async def generate(
             return mr_url
 
     except Exception as e:
-        typer.echo(f"Error generating code: {e}")
-        raise
+        print(f"Error generating code: {e}")
+        raise typer.Exit(1)
 
 @app.command()
-async def review(
+def review(
     branch_name: str = typer.Argument(..., help="Branch name (e.g. feature/my-branch)"),
     approve: bool = typer.Option(False, "--approve", help="Approve the PR if no issues found")
 ):
     """Review code changes in a pull request and provide feedback."""
+    return run_async_command(_review(branch_name, approve))
+
+async def _review(branch_name: str, approve: bool):
+    """Async implementation of review command."""
     print(f"\n=== Debug: Review Command ===")
     print(f"Branch name: {branch_name}")
     print(f"Auto approve: {approve}")
@@ -319,7 +407,7 @@ async def review(
             print(f"Changes: +{file.additions} -{file.deletions}")
             print("======================================\n")
 
-            # Get the file content
+            # Get the file
             if file.status != "removed":
                 content = git.repo.get_contents(file.filename, ref=branch_name).decoded_content.decode()
                 
@@ -378,8 +466,8 @@ async def review(
             )
             print(f"Created review with event: {event}")
 
-        typer.echo(f"Successfully reviewed pull request: {pr.html_url}")
+        print(f"Successfully reviewed pull request: {pr.html_url}")
 
     except Exception as e:
-        typer.echo(f"Error reviewing pull request: {e}")
-        raise 
+        print(f"Error reviewing pull request: {e}")
+        raise typer.Exit(1) 
