@@ -19,7 +19,14 @@ class OpenAILLM(LLMInterface):
             response = await openai.ChatCompletion.acreate(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a skilled software developer. Generate code based on the following prompt."},
+                    {"role": "system", "content": (
+                        "You are a skilled software developer.\n"
+                        "When generating a project, output each file as follows:\n"
+                        "=== FILE: relative/path/to/file.py ===\n<file content>\n"
+                        "Generate all files and folders as needed for the project.\n"
+                        "Do NOT include any explanations, markdown formatting, triple backticks (```), or README.md unless specifically asked.\n"
+                        "IMPORTANT: Only output file blocks in the format above. If you include triple backticks, markdown, or any explanation, the code will not be used and the generation will fail with an error."
+                    )},
                     {"role": "user", "content": prompt}
                 ]
             )
