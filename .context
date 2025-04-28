@@ -7,11 +7,13 @@ version control (git):
 4. Any code "dev_agent" generates in agent_workspace folder has to be in a feature branch (based on the task assigned to the dev_agent), tested and create an MR to main branch.
 
 
-Guidelines for code change to dev_agent (updating the software developer agent):
-This will outline rules to following while making changes to dev_agent
-1. Always make change in "dev_agent" folder.
-2. Never make changes in main branch. Always use a feature branch to work on a feature. Incremental changes to a feature will be done in a temporary user task branch and sent for review by creating an MR to feature branch.
-3. Any changes to requirements.txt must be reviewed and approved by Pratik before merging.
+Guidelines for code change to dev_agent:
+1. The dev_agent project must be run under a Python virtual environment, which needs to be activated before running any dev_agent commands.
+2. The dev_agent project must be installed in development mode using `pip install -e .` before running any commands.
+3. All code changes must be made through the dev_agent CLI commands (generate, review, respond) and not directly in the codebase.
+4. The agent_workspace directory is strictly managed by dev_agent - no manual modifications should be made to files in this directory.
+5. All changes to the agent_workspace must be made through the dev_agent CLI commands to maintain consistency and proper version control.
+6. When an agent starts on a new feature the git branch should be created from main branch.
 
 
 Guideslines for the developer agent to make code change

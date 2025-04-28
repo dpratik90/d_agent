@@ -9,6 +9,7 @@ from typing import Optional, Dict, Tuple
 from .config.settings import Settings
 from .core.llm.openai_llm import OpenAILLM
 from .core.git.git_manager import GitManager
+import tempfile
 
 # Initialize settings and components
 settings = Settings()
@@ -225,17 +226,24 @@ def respond(
         typer.echo(f"Error responding to review: {e}")
 
 @app.command()
-async def generate(
+def generate(
     task: str = typer.Argument(..., help="Task description"),
-    output_file: str = typer.Argument(..., help="Output file path"),
     branch_name: str = typer.Argument(..., help="Branch name (e.g. my-feature)"),
     create_mr: bool = typer.Option(False, "--create-mr", help="Create merge request"),
     mr_title: str = typer.Option(None, "--mr-title", help="Merge request title")
 ):
     """Generate code based on task description and create a feature branch."""
+    asyncio.run(_generate(task, branch_name, create_mr, mr_title))
+
+async def _generate(
+    task: str,
+    branch_name: str,
+    create_mr: bool,
+    mr_title: Optional[str]
+):
+    """Async implementation of generate command."""
     print(f"\n=== Debug: Generate Command ===")
     print(f"Task: {task}")
-    print(f"Output file: {output_file}")
     print(f"Branch name: {branch_name}")
     print(f"Create MR: {create_mr}")
     print(f"MR title: {mr_title}")
@@ -246,16 +254,36 @@ async def generate(
         branch = git.create_feature_branch(branch_name)
         print(f"Created feature branch: {branch}")
 
-        # Generate code
+        # Generate code (expecting multi-file structure in response)
         generated_code = await llm.generate_code(task)
         print("Generated code successfully")
 
-        # Write code to file
-        output_path = os.path.join(git.workspace_path, output_file)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, 'w') as f:
-            f.write(generated_code)
-        print(f"Wrote code to {output_path}")
+        # More robust regex: tolerate whitespace, optional leading slash, optional triple backticks (with or without language), and print raw output if parsing fails
+        file_pattern = re.compile(
+            r"^\s*=+ FILE: ?/?([\w\-/\.]+) =+\s*\n"  # delimiter, optional leading slash
+            r"(?:```[a-zA-Z]*\n)?"                        # optional triple backtick with/without language
+            r"(.*?)"                                      # file content (non-greedy)
+            r"(?:\n```)?"                                # optional closing triple backtick
+            r"(?=\n\s*=+ FILE: |\n\s*=+ FILE: END =+|\Z)",  # next delimiter or end
+            re.DOTALL | re.MULTILINE
+        )
+        files_written = []
+        for match in file_pattern.finditer(generated_code + '\n=== FILE: END ==='):
+            file_path, file_content = match.group(1).strip(), match.group(2).strip()
+            abs_path = os.path.join(git.workspace_path, file_path)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, 'w') as f:
+                f.write(file_content)
+            files_written.append(file_path)
+            print(f"Wrote code to {abs_path}")
+
+        # If no valid file delimiters are found, print raw LLM output to a temp file for debugging
+        if not files_written:
+            with tempfile.NamedTemporaryFile('w', delete=False, suffix='.llm_output.txt') as tmpf:
+                tmpf.write(generated_code)
+                debug_path = tmpf.name
+            typer.echo(f"Error: No valid file delimiters (=== FILE: ...) found in LLM output. Generation failed. Raw LLM output saved to {debug_path} for debugging.")
+            raise RuntimeError("No valid file delimiters found in LLM output.")
 
         # Commit and push changes
         git.commit_changes(f"feat: {task}")
@@ -275,11 +303,18 @@ async def generate(
         raise
 
 @app.command()
-async def review(
+def review(
     branch_name: str = typer.Argument(..., help="Branch name (e.g. feature/my-branch)"),
     approve: bool = typer.Option(False, "--approve", help="Approve the PR if no issues found")
 ):
-    """Review code changes in a pull request and provide feedback."""
+    """Review code changes in a pull request."""
+    asyncio.run(_review(branch_name, approve))
+
+async def _review(
+    branch_name: str,
+    approve: bool
+):
+    """Async implementation of review command."""
     print(f"\n=== Debug: Review Command ===")
     print(f"Branch name: {branch_name}")
     print(f"Auto approve: {approve}")
@@ -383,3 +418,11 @@ async def review(
     except Exception as e:
         typer.echo(f"Error reviewing pull request: {e}")
         raise 
+
+@app.callback()
+def main():
+    """Developer Agent CLI tool."""
+    pass
+
+if __name__ == "__main__":
+    app() 
