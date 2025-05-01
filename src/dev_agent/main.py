@@ -10,11 +10,16 @@ from .config.settings import Settings
 from .core.llm.openai_llm import OpenAILLM
 from .core.git.git_manager import GitManager
 import tempfile
+import subprocess
+from .core.context import ProjectContext
 
 # Initialize settings and components
 settings = Settings()
 llm = OpenAILLM(settings)
 git = GitManager(settings)
+
+# Initialize project context
+project_context = ProjectContext(git.workspace_path)
 
 # Create Typer app
 app = typer.Typer()
@@ -254,17 +259,67 @@ async def _generate(
         branch = git.create_feature_branch(branch_name)
         print(f"Created feature branch: {branch}")
 
-        # Generate code (expecting multi-file structure in response)
-        generated_code = await llm.generate_code(task)
+        # Get current project context
+        current_project = project_context.get_current_project()
+        
+        # Prepare the prompt based on whether we're updating an existing project
+        if current_project:
+            # Build context with all relevant files
+            file_contexts = []
+            for file_path, metadata in current_project['files'].items():
+                content = project_context.get_file_content(file_path)
+                if content:
+                    file_contexts.append(f"File: {file_path}\nType: {metadata['type']}\nContent:\n{content}\n")
+            
+            # We're updating an existing project
+            project_info = f"""Current project: {current_project['name']}
+Project type: {current_project['type']}
+Project path: {current_project['path']}
+
+Project files:
+{'-' * 40}
+{'\n'.join(file_contexts)}
+{'-' * 40}
+
+Task: {task}
+
+Please update the project to implement this task. For each file that needs to be modified:
+1. Preserve existing functionality unless it conflicts with the task
+2. Add new functionality required by the task
+3. Update any code that needs to be changed
+4. Maintain the same coding style and structure
+5. Update configuration files (requirements.txt, .env, etc.) if needed
+
+Format your response with file markers as before:
+=== FILE: path/to/file ===
+[content]
+"""
+        else:
+            # We're creating a new project
+            project_info = f"""Task: {task}
+
+Please create a new project to implement this task. Include all necessary:
+1. Source code files
+2. Configuration files (requirements.txt, .env, etc.)
+3. Test files and configurations
+4. Documentation
+
+Format your response with file markers as before:
+=== FILE: path/to/file ===
+[content]
+"""
+
+        # Generate code
+        generated_code = await llm.generate_code(project_info)
         print("Generated code successfully")
 
-        # More robust regex: tolerate whitespace, optional leading slash, optional triple backticks (with or without language), and print raw output if parsing fails
+        # Process generated files
         file_pattern = re.compile(
-            r"^\s*=+ FILE: ?/?([\w\-/\.]+) =+\s*\n"  # delimiter, optional leading slash
-            r"(?:```[a-zA-Z]*\n)?"                        # optional triple backtick with/without language
-            r"(.*?)"                                      # file content (non-greedy)
-            r"(?:\n```)?"                                # optional closing triple backtick
-            r"(?=\n\s*=+ FILE: |\n\s*=+ FILE: END =+|\Z)",  # next delimiter or end
+            r"^\s*=+ FILE: ?/?([\w\-/\.]+) =+\s*\n"
+            r"(?:```[a-zA-Z]*\n)?"
+            r"(.*?)"
+            r"(?:\n```)?"
+            r"(?=\n\s*=+ FILE: |\n\s*=+ FILE: END =+|\Z)",
             re.DOTALL | re.MULTILINE
         )
         files_written = []
@@ -284,6 +339,21 @@ async def _generate(
                 debug_path = tmpf.name
             typer.echo(f"Error: No valid file delimiters (=== FILE: ...) found in LLM output. Generation failed. Raw LLM output saved to {debug_path} for debugging.")
             raise RuntimeError("No valid file delimiters found in LLM output.")
+
+        # Update project context if this is a new project
+        if not current_project:
+            # Extract project name from the first directory in the path
+            project_name = files_written[0].split('/')[0] if files_written else "unknown"
+            project_type = "python"  # Default to Python, can be enhanced based on files
+            project_path = os.path.join(git.workspace_path, project_name)
+            project_context.set_current_project(project_name, project_type, project_path)
+        else:
+            # Update the project context with new/modified files
+            project_context.set_current_project(
+                current_project['name'],
+                current_project['type'],
+                current_project['path']
+            )
 
         # Commit and push changes
         git.commit_changes(f"feat: {task}")
@@ -418,6 +488,138 @@ async def _review(
     except Exception as e:
         typer.echo(f"Error reviewing pull request: {e}")
         raise 
+
+@app.command()
+def test_generate(
+    branch_name: str = typer.Argument(..., help="Branch name (e.g. feature/my-branch)"),
+    create_mr: bool = typer.Option(False, "--create-mr", help="Create merge request after generating tests"),
+    mr_title: str = typer.Option(None, "--mr-title", help="Merge request title")
+):
+    """Generate unit tests for all modules in the feature branch."""
+    asyncio.run(_test_generate(branch_name, create_mr, mr_title))
+
+async def _test_generate(branch_name: str, create_mr: bool, mr_title: str):
+    print(f"\n=== Debug: Test Generate Command ===")
+    print(f"Branch name: {branch_name}")
+    print("======================================\n")
+
+    try:
+        # Checkout the feature branch
+        branch = git.create_feature_branch(branch_name)
+        print(f"Checked out branch: {branch}")
+
+        # Scan app/ for Python modules
+        app_dir = os.path.join(git.workspace_path, "app")
+        tests_dir = os.path.join(git.workspace_path, "tests")
+        os.makedirs(tests_dir, exist_ok=True)
+        module_files = []
+        for root, dirs, files in os.walk(app_dir):
+            for file in files:
+                if file.endswith(".py") and not file.startswith("__init__"):
+                    module_path = os.path.join(root, file)
+                    module_files.append(module_path)
+        print(f"Found {len(module_files)} modules in app/: {module_files}")
+
+        test_files_written = []
+        for module_path in module_files:
+            with open(module_path, "r") as f:
+                module_code = f.read()
+            module_name = os.path.splitext(os.path.basename(module_path))[0]
+            test_file_name = f"test_{module_name}.py"
+            test_file_path = os.path.join(tests_dir, test_file_name)
+            print(f"Generating tests for {module_path} -> {test_file_path}")
+
+            # LLM prompt for test generation
+            prompt = (
+                "Generate comprehensive pytest unit tests for the following FastAPI module. "
+                "Cover all functions, edge cases, and error handling. "
+                "Output only the test code, no explanations.\n\n"
+                "=== MODULE CODE START ===\n"
+                f"{module_code}\n"
+                "=== MODULE CODE END ==="
+            )
+            test_code = await llm.generate_code(prompt)
+
+            # Strip any leading === FILE: ... === block and optional triple backticks from LLM output
+            test_code_clean = test_code.strip()
+            file_block_pattern = re.compile(r"^=+ FILE:.*?=+\s*\n(?:```[a-zA-Z]*\n)?(.*?)(?:\n```)?\s*$", re.DOTALL)
+            match = file_block_pattern.match(test_code_clean)
+            if match:
+                test_code_clean = match.group(1).strip()
+
+            # Write the cleaned test code
+            with open(test_file_path, "w") as f:
+                f.write(test_code_clean)
+            test_files_written.append(test_file_path)
+            print(f"Wrote tests to {test_file_path}")
+
+        # Commit and push test files
+        if test_files_written:
+            git.commit_changes(f"test: add generated unit tests for {branch_name}")
+            git.push_changes(branch)
+            print("Committed and pushed generated tests.")
+            # Optionally create a merge request
+            if create_mr:
+                title = mr_title or f"test: add generated unit tests for {branch_name}"
+                description = f"Generated unit tests for branch: {branch_name}"
+                mr_url = git.create_merge_request(branch, title, description)
+                print(f"Created merge request: {mr_url}")
+        else:
+            print("No test files were generated.")
+
+        print("\n=== Test Generation Summary ===")
+        for tf in test_files_written:
+            print(f"Generated: {tf}")
+        print("======================================\n")
+
+    except Exception as e:
+        typer.echo(f"Error generating tests: {e}")
+        raise
+
+@app.command()
+def test_run(
+    branch_name: str = typer.Argument(..., help="Branch name (e.g. feature/my-branch)")
+):
+    """Run all unit tests for the given feature branch and print a summary."""
+    _test_run(branch_name)
+
+def _test_run(branch_name: str):
+    print(f"\n=== Debug: Test Run Command ===")
+    print(f"Branch name: {branch_name}")
+    print("======================================\n")
+
+    try:
+        # Checkout the feature branch
+        branch = git.create_feature_branch(branch_name)
+        print(f"Checked out branch: {branch}")
+
+        # Ensure tests directory exists
+        tests_dir = os.path.join(git.workspace_path, "tests")
+        if not os.path.isdir(tests_dir):
+            print(f"No tests directory found at {tests_dir}. Aborting.")
+            return
+
+        # Run pytest in the tests directory
+        print(f"Running pytest in {tests_dir} ...")
+        result = subprocess.run([
+            "pytest", tests_dir, "--maxfail=10", "--disable-warnings", "-v"
+        ], capture_output=True, text=True)
+
+        print("\n=== Pytest Output ===")
+        print(result.stdout)
+        print("====================\n")
+
+        if result.returncode == 0:
+            print("All tests passed! ✅")
+        else:
+            print("Some tests failed. ❌")
+            print(result.stderr)
+        print(f"Exit code: {result.returncode}")
+        return result.returncode
+
+    except Exception as e:
+        typer.echo(f"Error running tests: {e}")
+        raise
 
 @app.callback()
 def main():
